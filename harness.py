@@ -1,27 +1,25 @@
 """
-Harness Service Detail Report (read-only, no changes made to anything).
+SCRIPT 1 of 3 — Harness extraction into the shared master Excel file.
 
-For every service in the configured org/project, pulls out:
-  - Advanced > Variables          (e.g. ssc_appname, ssc_appversion)
-  - Manifest(s): identifier, git fetch type, BRANCH, file/folder path(s),
-    values.yaml path(s)
-  - Artifact source(s): identifier, type, repository, ARTIFACT PATH
+Creates (or merges into) MASTER_EXCEL_FILE, one row per Harness service.
+This script only ever writes to the columns it owns (see OWNED_COLUMNS
+below) — anything Script 2 or Script 3 has already filled in for a given
+service is left exactly as-is on re-run.
 
-This is the discovery step before any update — run this first, eyeball the
-Excel output, confirm the field names/paths look right for your services,
-*then* move to the update script.
+Run this first. Script 2 (GitLab extraction) and Script 3 (Harness update)
+both read/write the same file afterwards.
 
 pip install requests pyyaml openpyxl --break-system-packages
 """
 
-import json
+import os
 import time
 import logging
 from datetime import datetime
 
 import yaml
 import requests
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -35,37 +33,56 @@ HARNESS_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 HARNESS_ORG_ID = "default"
 HARNESS_PROJECT_ID = "YOUR_PROJECT_ID"
 
-# Which Advanced > Variables to pull out into their own columns
-# (name -> report column label). Anything else found is still captured in
-# the "All Variables" column.
-VARIABLES_OF_INTEREST = {
-    "ssc_appname": "ssc_appname",
-    "ssc_appversion": "ssc_appversion",
-}
+# Best-effort Harness NG service URL. Verify against one real service URL
+# from your instance and adjust if it doesn't match — the exact routing
+# has changed between Harness versions before.
+HARNESS_APP_URL_TEMPLATE = (
+    "https://app.harness.io/ng/account/{account}/module/cd/orgs/{org}"
+    "/projects/{project}/services/{service}/summary"
+)
+
+MASTER_EXCEL_FILE = "harness_gitlab_master.xlsx"
+LOG_FILE = f"script1_harness_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 SLEEP_BETWEEN_SERVICES = 0.15
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
 
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_FILE = f"harness_service_report_{RUN_ID}.log"
-REPORT_FILE = f"harness_service_report_{RUN_ID}.xlsx"
+# ===========================================================================
+# Shared column schema — every script in this 3-script set uses this exact
+# list and order. Keep it identical across all three files.
+# ===========================================================================
+
+ALL_COLUMNS = [
+    "Service Identifier", "Service Name", "Service Url",
+    "Corresponding Gitlab component", "GitLab File Path",
+    "Existing_Branch", "New_Branch",
+    "Existing_ssc_appname", "New_ssc_appname",
+    "Existing_ssc_appversion", "New_ssc_appversion",
+    "Artifact Path",
+    "Approved for Update (Y/N)", "Variables Updated",
+    "Comments", "Last Run Timestamp",
+]
+
+# Columns THIS script is allowed to write. Everything else on a row is
+# left untouched, even if the row already exists in the file.
+OWNED_COLUMNS = [
+    "Service Identifier", "Service Name", "Service Url",
+    "Existing_Branch", "Existing_ssc_appname", "Existing_ssc_appversion",
+    "Artifact Path",
+]
 
 # ===========================================================================
 # Logging
 # ===========================================================================
 
-logger = logging.getLogger("report")
+logger = logging.getLogger("script1")
 logger.setLevel(logging.DEBUG)
-
 fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-fh.setLevel(logging.DEBUG)
 fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)
 ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-
 logger.addHandler(fh)
 logger.addHandler(ch)
 
@@ -126,170 +143,119 @@ def get_service_yaml(service_identifier: str) -> dict:
     return yaml.safe_load(raw_yaml) or {}
 
 
-# ===========================================================================
-# Extraction logic
-# ===========================================================================
-
-
 def get_spec(yaml_dict: dict) -> dict:
-    return (
-        yaml_dict.get("service", {})
-        .get("serviceDefinition", {})
-        .get("spec", {})
-    ) or {}
+    return (yaml_dict.get("service", {}).get("serviceDefinition", {}).get("spec", {})) or {}
 
 
 def extract_variables(spec: dict) -> dict:
-    """Returns {var_name: value} for every Advanced > Variables entry."""
-    out = {}
-    for var in spec.get("variables", []) or []:
-        out[var.get("name")] = var.get("value")
-    return out
+    return {v.get("name"): v.get("value") for v in (spec.get("variables") or [])}
 
 
-def extract_manifests(spec: dict) -> list[dict]:
-    """One dict per manifest entry: identifier, branch, paths, etc."""
-    rows = []
-    for entry in spec.get("manifests", []) or []:
-        m = entry.get("manifest", {}) or {}
-        m_spec = m.get("spec", {}) or {}
+def extract_first_branch(spec: dict) -> str:
+    """
+    First manifest's branch (or commitId if it's pinned to a commit).
+
+    Some manifests use the Harness File Store instead of Git/GitHub/
+    GitLab/Bitbucket — there's no branch concept for those. Rather than
+    leaving the cell blank (which reads like missing data), report the
+    literal "Harness" so it's clear this manifest isn't Git-sourced at all.
+    """
+    manifests = spec.get("manifests", []) or []
+    saw_harness_store = False
+    for entry in manifests:
+        m_spec = (entry.get("manifest", {}) or {}).get("spec", {}) or {}
         store = m_spec.get("store", {}) or {}
         store_spec = store.get("spec", {}) or {}
-
-        rows.append({
-            "identifier": m.get("identifier"),
-            "type": m.get("type"),
-            "store_type": store.get("type"),
-            "connector_ref": store_spec.get("connectorRef"),
-            "git_fetch_type": store_spec.get("gitFetchType"),
-            "branch": store_spec.get("branch"),
-            "commit_id": store_spec.get("commitId"),
-            "paths": "; ".join(store_spec.get("paths", []) or []),
-            "values_paths": "; ".join(m_spec.get("valuesPaths", []) or []),
-        })
-    return rows
+        branch = store_spec.get("branch") or store_spec.get("commitId")
+        if branch:
+            return branch
+        if store.get("type") == "Harness":
+            saw_harness_store = True
+    return "Harness" if saw_harness_store else ""
 
 
-# Field names Harness uses for "artifact path" across the various source
-# types (Docker Registry uses imagePath, Nexus3/Artifactory use
-# artifactPath, etc.) — checked in this order, first match wins.
 ARTIFACT_PATH_FIELDS = ["artifactPath", "imagePath", "artifactDirectory", "repositoryUrl"]
 
 
-def _extract_artifact_entry(identifier: str, a_type: str, a_spec: dict, role: str) -> dict:
-    artifact_path = None
-    for field in ARTIFACT_PATH_FIELDS:
-        if a_spec.get(field):
-            artifact_path = a_spec.get(field)
-            break
-    return {
-        "role": role,
-        "identifier": identifier,
-        "type": a_type,
-        "connector_ref": a_spec.get("connectorRef"),
-        "repository": a_spec.get("repository"),
-        "repository_format": a_spec.get("repositoryFormat"),
-        "artifact_path": artifact_path,
-        "tag": a_spec.get("tag"),
-        "raw_spec": json.dumps(a_spec, default=str),
-    }
-
-
-def extract_artifacts(spec: dict) -> list[dict]:
-    rows = []
+def extract_first_artifact_path(spec: dict) -> str:
     artifacts = spec.get("artifacts", {}) or {}
-
     primary = artifacts.get("primary", {}) or {}
-    if "sources" in primary:  # newer multi-source schema
-        for src in primary.get("sources", []) or []:
-            rows.append(_extract_artifact_entry(
-                src.get("identifier"), src.get("type"), src.get("spec", {}) or {}, "primary"
-            ))
-    elif primary.get("spec"):  # older single-artifact schema
-        rows.append(_extract_artifact_entry(
-            primary.get("identifier", "primary"), primary.get("type"),
-            primary.get("spec", {}) or {}, "primary"
-        ))
-
-    for sidecar in artifacts.get("sidecars", []) or []:
-        s = sidecar.get("sidecar", {}) or {}
-        rows.append(_extract_artifact_entry(
-            s.get("identifier"), s.get("type"), s.get("spec", {}) or {}, "sidecar"
-        ))
-
-    return rows
+    sources = primary.get("sources") or ([primary] if primary.get("spec") else [])
+    for src in sources:
+        a_spec = src.get("spec", {}) or {}
+        for field in ARTIFACT_PATH_FIELDS:
+            if a_spec.get(field):
+                return a_spec[field]
+    return ""
 
 
 # ===========================================================================
-# Report
+# Master Excel file — load/merge/save
 # ===========================================================================
 
-REPORT_COLUMNS = [
-    "Service Identifier", "Service Name",
-    "ssc_appname", "ssc_appversion", "All Variables",
-    "Manifest Identifier(s)", "Branch(es)", "Git Fetch Type(s)",
-    "File/Folder Path(s)", "Values.yaml Path(s)",
-    "Artifact Source Identifier(s)", "Artifact Type(s)",
-    "Repository", "Artifact Path(s)",
-    "Notes / Error",
-]
 
-report_rows: list[list] = []
-
-
-def build_row(svc_id, svc_name, variables, manifests, artifacts, notes=""):
-    var_lookup = {k: variables.get(k, "") for k in VARIABLES_OF_INTEREST}
-    all_vars_str = "; ".join(f"{k}={v}" for k, v in variables.items())
-
-    manifest_ids = "; ".join(m["identifier"] or "" for m in manifests)
-    branches = "; ".join((m["branch"] or m["commit_id"] or "") for m in manifests)
-    fetch_types = "; ".join(m["git_fetch_type"] or "" for m in manifests)
-    paths = "; ".join(m["paths"] for m in manifests if m["paths"])
-    values_paths = "; ".join(m["values_paths"] for m in manifests if m["values_paths"])
-
-    artifact_ids = "; ".join(a["identifier"] or "" for a in artifacts)
-    artifact_types = "; ".join(a["type"] or "" for a in artifacts)
-    repos = "; ".join(a["repository"] or "" for a in artifacts if a["repository"])
-    artifact_paths = "; ".join(a["artifact_path"] or "" for a in artifacts if a["artifact_path"])
-
-    report_rows.append([
-        svc_id, svc_name,
-        var_lookup.get("ssc_appname", ""), var_lookup.get("ssc_appversion", ""),
-        all_vars_str,
-        manifest_ids, branches, fetch_types, paths, values_paths,
-        artifact_ids, artifact_types, repos, artifact_paths,
-        notes,
-    ])
+def load_or_create_master():
+    if os.path.exists(MASTER_EXCEL_FILE):
+        wb = load_workbook(MASTER_EXCEL_FILE)
+        ws = wb.active
+        header = [c.value for c in ws[1]]
+        if header != ALL_COLUMNS:
+            raise ValueError(
+                f"{MASTER_EXCEL_FILE} exists but its header doesn't match the "
+                f"expected schema. Fix the header or rename the old file before "
+                f"re-running.\nExpected: {ALL_COLUMNS}\nFound:    {header}"
+            )
+        logger.info("Loaded existing master file with %s existing rows", ws.max_row - 1)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Master"
+        ws.append(ALL_COLUMNS)
+        style_header(ws)
+        logger.info("Created new master file: %s", MASTER_EXCEL_FILE)
+    return wb, ws
 
 
-def write_excel_report():
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Service Details"
-    ws.append(REPORT_COLUMNS)
-
+def style_header(ws):
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
-    for col_idx in range(1, len(REPORT_COLUMNS) + 1):
+    for col_idx in range(1, len(ALL_COLUMNS) + 1):
         cell = ws.cell(row=1, column=col_idx)
         cell.fill = header_fill
         cell.font = header_font
-
-    error_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    notes_col_idx = REPORT_COLUMNS.index("Notes / Error") + 1
-
-    for row_idx, row in enumerate(report_rows, start=2):
-        ws.append(row)
-        if row[notes_col_idx - 1]:
-            for col_idx in range(1, len(REPORT_COLUMNS) + 1):
-                ws.cell(row=row_idx, column=col_idx).fill = error_fill
-
-    for col_idx, header in enumerate(REPORT_COLUMNS, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = max(len(header) + 2, 20)
-
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(len(ALL_COLUMNS[col_idx - 1]) + 2, 20)
     ws.freeze_panes = "A2"
-    wb.save(REPORT_FILE)
-    logger.info("Excel report written to %s", REPORT_FILE)
+
+
+def build_row_index(ws) -> dict:
+    """service_identifier -> row number, for existing rows."""
+    id_col = ALL_COLUMNS.index("Service Identifier") + 1
+    index = {}
+    for row_idx in range(2, ws.max_row + 1):
+        sid = ws.cell(row=row_idx, column=id_col).value
+        if sid:
+            index[sid] = row_idx
+    return index
+
+
+def set_owned_cell(ws, row_idx: int, column_name: str, value):
+    if column_name not in OWNED_COLUMNS:
+        raise ValueError(f"Script 1 tried to write a column it doesn't own: {column_name}")
+    col_idx = ALL_COLUMNS.index(column_name) + 1
+    ws.cell(row=row_idx, column=col_idx, value=value)
+
+
+def append_comment(ws, row_idx: int, text: str):
+    col_idx = ALL_COLUMNS.index("Comments") + 1
+    cell = ws.cell(row=row_idx, column=col_idx)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new_note = f"[Script1 {stamp}] {text}"
+    cell.value = f"{cell.value}\n{new_note}" if cell.value else new_note
+
+
+def set_timestamp(ws, row_idx: int):
+    col_idx = ALL_COLUMNS.index("Last Run Timestamp") + 1
+    ws.cell(row=row_idx, column=col_idx, value=datetime.now().isoformat(timespec="seconds"))
 
 
 # ===========================================================================
@@ -298,40 +264,61 @@ def write_excel_report():
 
 
 def main():
-    logger.info("=== Service detail report run %s started ===", RUN_ID)
+    logger.info("=== Script 1 (Harness extract) started ===")
     services = list_all_services()
+    wb, ws = load_or_create_master()
+    row_index = build_row_index(ws)
 
     for i, service in enumerate(services, start=1):
         svc_id, svc_name = service["identifier"], service["name"]
         logger.info("[%s/%s] %s (%s)", i, len(services), svc_name, svc_id)
+
+        row_idx = row_index.get(svc_id)
+        if row_idx is None:
+            ws.append([""] * len(ALL_COLUMNS))
+            row_idx = ws.max_row
+            set_owned_cell(ws, row_idx, "Service Identifier", svc_id)
+            row_index[svc_id] = row_idx
+
         try:
             yaml_dict = get_service_yaml(svc_id)
             spec = get_spec(yaml_dict)
             variables = extract_variables(spec)
-            manifests = extract_manifests(spec)
-            artifacts = extract_artifacts(spec)
+            branch = extract_first_branch(spec)
+            artifact_path = extract_first_artifact_path(spec)
+            service_url = HARNESS_APP_URL_TEMPLATE.format(
+                account=HARNESS_ACCOUNT_ID, org=HARNESS_ORG_ID,
+                project=HARNESS_PROJECT_ID, service=svc_id,
+            )
 
-            notes = []
-            if not manifests:
-                notes.append("no manifests found")
-            if not artifacts:
-                notes.append("no artifact sources found")
-            if not variables:
-                notes.append("no variables found")
+            set_owned_cell(ws, row_idx, "Service Name", svc_name)
+            set_owned_cell(ws, row_idx, "Service Url", service_url)
+            set_owned_cell(ws, row_idx, "Existing_Branch", branch)
+            set_owned_cell(ws, row_idx, "Existing_ssc_appname", variables.get("ssc_appname", ""))
+            set_owned_cell(ws, row_idx, "Existing_ssc_appversion", variables.get("ssc_appversion", ""))
+            set_owned_cell(ws, row_idx, "Artifact Path", artifact_path)
 
-            build_row(svc_id, svc_name, variables, manifests, artifacts, "; ".join(notes))
+            if not branch:
+                append_comment(ws, row_idx, "No manifest branch found")
+            if not artifact_path:
+                append_comment(ws, row_idx, "No artifact path found")
+            if "ssc_appname" not in variables or "ssc_appversion" not in variables:
+                append_comment(ws, row_idx, "One or both ssc_ variables missing on Harness")
 
         except Exception as exc:  # noqa: BLE001 — keep going across 330 services
             logger.error("Failed on service '%s': %s", svc_name, exc)
-            build_row(svc_id, svc_name, {}, [], [], notes=f"ERROR: {exc}")
+            set_owned_cell(ws, row_idx, "Service Name", svc_name)
+            append_comment(ws, row_idx, f"ERROR during extraction: {exc}")
 
+        set_timestamp(ws, row_idx)
         time.sleep(SLEEP_BETWEEN_SERVICES)
 
-    write_excel_report()
-    logger.info("=== Run complete: %s services processed ===", len(services))
+    wb.save(MASTER_EXCEL_FILE)
+    logger.info("=== Script 1 complete: %s services processed, saved to %s ===",
+                len(services), MASTER_EXCEL_FILE)
     print(f"\nDone. {len(services)} services processed.")
-    print(f"Log file:     {LOG_FILE}")
-    print(f"Excel report: {REPORT_FILE}")
+    print(f"Master file: {MASTER_EXCEL_FILE}")
+    print(f"Log file:    {LOG_FILE}")
 
 
 if __name__ == "__main__":
