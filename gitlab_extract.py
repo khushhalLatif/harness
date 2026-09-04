@@ -138,12 +138,14 @@ def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
 
 
 def search_gitlab_projects(term: str) -> list[dict]:
-    params = {"search": term}
+    params = {"search": term, "per_page": 100}
     if GITLAB_GROUP_PATH:
-        # GitLab's group-projects endpoint accepts either a numeric group ID
-        # or a URL-encoded full path (e.g. "fiserv/backend-services") in
-        # this slot — quote() turns the "/" into %2F, which is what makes
-        # the path form work here.
+        # Without this, GitLab only returns projects directly inside the
+        # group — not anything in subgroups. A deeply nested group path
+        # (e.g. "na/gfs/prepaid/moneynetwork/mn-2.0") almost always means
+        # the actual repos live in subgroups underneath it, so this needs
+        # to be explicit or the search comes back empty every time.
+        params["include_subgroups"] = "true"
         url = f"{GITLAB_BASE_URL}/api/v4/groups/{requests.utils.quote(GITLAB_GROUP_PATH, safe='')}/projects"
     else:
         url = f"{GITLAB_BASE_URL}/api/v4/projects"
@@ -158,6 +160,74 @@ def get_project_by_path(path: str) -> dict | None:
     if resp.status_code == 200:
         return resp.json()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Group project cache — fetched once per run, matched against client-side.
+#
+# GitLab's own "search" query param on project-listing endpoints is a known
+# weak spot: it reliably matches a project's display NAME, but doesn't
+# consistently match its PATH (the URL slug) — see GitLab issue #47909 and
+# related community reports. Since we're usually matching against a path-
+# style term (e.g. "ms-alert-consumer" out of an artifact path), relying on
+# that search param can silently miss projects that are right there.
+#
+# Fixing this by fetching the full project list under the group ONCE (all
+# pages, with subgroups), caching it in memory, and doing our own
+# case-insensitive matching against BOTH path and name. This is also
+# considerably faster than 2 live search calls per row x 330 rows.
+# ---------------------------------------------------------------------------
+
+_group_projects_cache: list[dict] | None = None
+
+
+def fetch_all_group_projects() -> list[dict]:
+    projects = []
+    page = 1
+    encoded = requests.utils.quote(GITLAB_GROUP_PATH, safe="")
+    url = f"{GITLAB_BASE_URL}/api/v4/groups/{encoded}/projects"
+    while page <= 100:  # safety cap — 10,000 projects at 100/page
+        resp = request_with_retry(
+            "GET", url, headers=GITLAB_HEADERS,
+            params={"include_subgroups": "true", "per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        projects.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    logger.info("Fetched %s total project(s) under group '%s' (including subgroups)",
+                len(projects), GITLAB_GROUP_PATH)
+    return projects
+
+
+def get_group_projects_cached() -> list[dict]:
+    global _group_projects_cache
+    if _group_projects_cache is None:
+        _group_projects_cache = fetch_all_group_projects() if GITLAB_GROUP_PATH else []
+    return _group_projects_cache
+
+
+def _normalize(s: str) -> str:
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
+def find_matches_in_group(term: str) -> list[dict]:
+    if not term:
+        return []
+    term_norm = _normalize(term)
+    projects = get_group_projects_cached()
+
+    exact = [p for p in projects
+             if _normalize(p.get("path", "")) == term_norm or _normalize(p.get("name", "")) == term_norm]
+    if exact:
+        return exact
+
+    return [p for p in projects
+            if term_norm in _normalize(p.get("path", "")) or term_norm in _normalize(p.get("name", ""))]
 
 
 def resolve_gitlab_project(existing_component: str, service_name: str, artifact_path: str):
@@ -179,18 +249,24 @@ def resolve_gitlab_project(existing_component: str, service_name: str, artifact_
             terms.append(term)
 
     pool = {}
-    for term in terms:
-        try:
-            for proj in search_gitlab_projects(term):
+    if GITLAB_GROUP_PATH:
+        for term in terms:
+            for proj in find_matches_in_group(term):
                 pool[proj["id"]] = proj
-        except requests.HTTPError as exc:
-            logger.warning("GitLab search failed for '%s': %s", term, exc)
+    else:
+        for term in terms:
+            try:
+                for proj in search_gitlab_projects(term):
+                    pool[proj["id"]] = proj
+            except requests.HTTPError as exc:
+                logger.warning("GitLab search failed for '%s': %s", term, exc)
 
     if not pool:
         return None, f"No GitLab project found for candidates: {terms}"
 
     lower_terms = [t.lower() for t in terms]
-    exact_matches = [p for p in pool.values() if p.get("name", "").lower() in lower_terms]
+    exact_matches = [p for p in pool.values()
+                      if p.get("name", "").lower() in lower_terms or p.get("path", "").lower() in lower_terms]
     if len(exact_matches) == 1:
         return exact_matches[0], ""
     if len(pool) == 1:
