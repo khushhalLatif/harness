@@ -6,8 +6,11 @@ This script only ever writes to the columns it owns (see OWNED_COLUMNS
 below) — anything Script 2 or Script 3 has already filled in for a given
 service is left exactly as-is on re-run.
 
+Credentials come from config.json in this same folder (see harness_config.py)
+— fill that in once and every script in this set reads from it.
+
 Run this first. Script 2 (GitLab extraction) and Script 3 (Harness update)
-both read/write the same file afterwards.
+both read/write the same master Excel file afterwards.
 
 pip install requests pyyaml openpyxl --break-system-packages
 """
@@ -23,15 +26,21 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from harness_config import load_config, require_harness
+
 # ===========================================================================
-# CONFIG
+# CONFIG — credentials come from config.json (same folder as this script).
+# Only things that are specific to this script stay here.
 # ===========================================================================
 
-HARNESS_BASE_URL = "https://app.harness.io/gateway"
-HARNESS_API_KEY = "YOUR_HARNESS_API_KEY"
-HARNESS_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
-HARNESS_ORG_ID = "default"
-HARNESS_PROJECT_ID = "YOUR_PROJECT_ID"
+_config = load_config()
+_harness = require_harness(_config)
+
+HARNESS_BASE_URL = _harness["base_url"]
+HARNESS_API_KEY = _harness["api_key"]
+HARNESS_ACCOUNT_ID = _harness["account_id"]
+HARNESS_ORG_ID = _harness["org_id"]
+HARNESS_PROJECT_ID = _harness["project_id"]
 
 # Best-effort Harness NG service URL. Verify against one real service URL
 # from your instance and adjust if it doesn't match — the exact routing
