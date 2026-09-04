@@ -186,15 +186,39 @@ def extract_first_branch(spec: dict) -> str:
 ARTIFACT_PATH_FIELDS = ["artifactPath", "imagePath", "artifactDirectory", "repositoryUrl"]
 
 
+def _find_first_field(node, field_names):
+    """
+    Recursively search a nested dict/list for the first matching field name,
+    checking all field_names at the current level (in priority order) before
+    descending into children. Needed because artifact source specs nest
+    differently by type — e.g. Nexus3Registry wraps format-specific fields
+    (artifactPath, repositoryUrl) inside an extra nested "spec" one level
+    deeper than DockerRegistry does.
+    """
+    if isinstance(node, dict):
+        for field in field_names:
+            if node.get(field):
+                return node[field]
+        for value in node.values():
+            result = _find_first_field(value, field_names)
+            if result:
+                return result
+    elif isinstance(node, list):
+        for item in node:
+            result = _find_first_field(item, field_names)
+            if result:
+                return result
+    return None
+
+
 def extract_first_artifact_path(spec: dict) -> str:
     artifacts = spec.get("artifacts", {}) or {}
     primary = artifacts.get("primary", {}) or {}
     sources = primary.get("sources") or ([primary] if primary.get("spec") else [])
     for src in sources:
-        a_spec = src.get("spec", {}) or {}
-        for field in ARTIFACT_PATH_FIELDS:
-            if a_spec.get(field):
-                return a_spec[field]
+        result = _find_first_field(src.get("spec", {}) or {}, ARTIFACT_PATH_FIELDS)
+        if result:
+            return result
     return ""
 
 
