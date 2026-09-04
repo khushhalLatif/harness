@@ -1,36 +1,15 @@
-import json
-import yaml
 import requests
 
-from harness_config import load_config, require_harness
+BASE_URL = "https://gitlab.onefiserv.net"
+TOKEN = "YOUR_REAL_TOKEN"
+headers = {"PRIVATE-TOKEN": TOKEN}
 
-config = load_config()
-harness = require_harness(config)
+# Test 1: is the token valid at all, no group needed?
+r1 = requests.get(f"{BASE_URL}/api/v4/user", headers=headers)
+print("User call:", r1.status_code, r1.text[:400])
 
-# The Harness SERVICE identifier — not the artifact source id ("uivaultportal")
-# or the manifest id ("mnportal") from your earlier screenshots. Grab it from
-# the "Service Identifier" column in the master Excel Script 1 already produced.
-SERVICE_IDENTIFIER = "PUT_ONE_SERVICE_IDENTIFIER_HERE"
-
-headers = {"x-api-key": harness["api_key"]}
-params = {
-    "accountIdentifier": harness["account_id"],
-    "orgIdentifier": harness["org_id"],
-    "projectIdentifier": harness["project_id"],
-}
-
-url = f"{harness['base_url']}/ng/api/servicesV2/{SERVICE_IDENTIFIER}"
-resp = requests.get(url, headers=headers, params=params)
-resp.raise_for_status()
-
-parsed = yaml.safe_load(resp.json()["data"]["service"]["yaml"])
-spec = parsed["service"]["serviceDefinition"]["spec"]
-
-print("=== Top-level keys in spec ===")
-print(list(spec.keys()))
-
-print("\n=== Raw 'artifacts' block ===")
-print(json.dumps(spec.get("artifacts", "NO ARTIFACTS KEY AT ALL"), indent=2))
-
-print("\n=== Raw 'manifests' block (for comparison) ===")
-print(json.dumps(spec.get("manifests", "NO MANIFESTS KEY"), indent=2))
+# Test 2: can it see the specific group?
+group_path = "na/gfs/prepaid/moneynetwork/mn-2.0"
+encoded = requests.utils.quote(group_path, safe="")
+r2 = requests.get(f"{BASE_URL}/api/v4/groups/{encoded}", headers=headers)
+print("Group call:", r2.status_code, r2.text[:400])
