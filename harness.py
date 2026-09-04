@@ -278,12 +278,25 @@ def set_owned_cell(ws, row_idx: int, column_name: str, value):
     ws.cell(row=row_idx, column=col_idx, value=value)
 
 
-def append_comment(ws, row_idx: int, text: str):
+def set_script_comment(ws, row_idx: int, script_tag: str, text: str):
+    """
+    Replace any PREVIOUS comment(s) from this script (identified by
+    script_tag, e.g. "Script1") with the current one — instead of
+    appending forever. Comments from other scripts (or notes you add by
+    hand) are left completely untouched, only matched by their own tag.
+
+    Pass an empty text to clear this script's line entirely (e.g. an
+    issue from a previous run has now been fixed and there's nothing
+    left to flag).
+    """
     col_idx = ALL_COLUMNS.index("Comments") + 1
     cell = ws.cell(row=row_idx, column=col_idx)
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    new_note = f"[Script1 {stamp}] {text}"
-    cell.value = f"{cell.value}\n{new_note}" if cell.value else new_note
+    existing_lines = (cell.value or "").split("\n")
+    other_lines = [line for line in existing_lines if line and not line.startswith(f"[{script_tag} ")]
+    if text:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        other_lines.append(f"[{script_tag} {stamp}] {text}")
+    cell.value = "\n".join(other_lines) if other_lines else None
 
 
 def set_timestamp(ws, row_idx: int):
@@ -331,17 +344,20 @@ def main():
             set_owned_cell(ws, row_idx, "Existing_ssc_appversion", variables.get("ssc_appversion", ""))
             set_owned_cell(ws, row_idx, "Artifact Path", artifact_path)
 
+            issues = []
             if not branch:
-                append_comment(ws, row_idx, "No manifest branch found")
+                issues.append("No manifest branch found")
             if not artifact_path:
-                append_comment(ws, row_idx, "No artifact path found")
+                issues.append("No artifact path found")
             if "ssc_appname" not in variables or "ssc_appversion" not in variables:
-                append_comment(ws, row_idx, "One or both ssc_ variables missing on Harness")
+                issues.append("One or both ssc_ variables missing on Harness")
+
+            set_script_comment(ws, row_idx, "Script1", "; ".join(issues))
 
         except Exception as exc:  # noqa: BLE001 — keep going across 330 services
             logger.error("Failed on service '%s': %s", svc_name, exc)
             set_owned_cell(ws, row_idx, "Service Name", svc_name)
-            append_comment(ws, row_idx, f"ERROR during extraction: {exc}")
+            set_script_comment(ws, row_idx, "Script1", f"ERROR during extraction: {exc}")
 
         set_timestamp(ws, row_idx)
         time.sleep(SLEEP_BETWEEN_SERVICES)
