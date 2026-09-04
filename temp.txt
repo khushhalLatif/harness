@@ -1,1 +1,15 @@
-https://app.harness.io/gateway/ng/api/organizations?accountIdentifier=fgDto6qoTT6ctfZS9eWbEw
+{
+  "harness": {
+    "base_url": "https://app.harness.io/gateway",
+    "api_key": "YOUR_HARNESS_API_KEY",
+    "account_id": "YOUR_ACCOUNT_ID",
+    "org_id": "YOUR_ORG_ID",
+    "project_id": "YOUR_PROJECT_ID"
+  },
+  "gitlab": {
+    "base_url": "https://gitlab.com",
+    "private_token": "YOUR_GITLAB_TOKEN",
+    "branch": "main",
+    "group_id": null
+  }
+}
