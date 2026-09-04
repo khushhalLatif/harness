@@ -1,77 +1,36 @@
-"""
-Shared config loader — every script in this project (Script 1, 2, 3, and any
-quick one-off test snippets) imports this instead of hardcoding credentials.
-
-Usage in a script:
-
-    from harness_config import load_config, require_harness
-
-    _config = load_config()
-    harness = require_harness(_config)
-
-    HARNESS_BASE_URL = harness["base_url"]
-    HARNESS_API_KEY = harness["api_key"]
-    HARNESS_ACCOUNT_ID = harness["account_id"]
-    HARNESS_ORG_ID = harness["org_id"]
-    HARNESS_PROJECT_ID = harness["project_id"]
-
-For a script that also needs GitLab, add:
-
-    from harness_config import require_gitlab
-    gitlab = require_gitlab(_config)
-
-config.json must sit in the SAME FOLDER as this file (and as the scripts
-that import it).
-"""
-
 import json
-import os
-import sys
+import yaml
+import requests
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+from harness_config import load_config, require_harness
 
-HARNESS_REQUIRED_FIELDS = ("base_url", "api_key", "account_id", "org_id", "project_id")
-GITLAB_REQUIRED_FIELDS = ("base_url", "private_token")
+config = load_config()
+harness = require_harness(config)
 
+# The Harness SERVICE identifier — not the artifact source id ("uivaultportal")
+# or the manifest id ("mnportal") from your earlier screenshots. Grab it from
+# the "Service Identifier" column in the master Excel Script 1 already produced.
+SERVICE_IDENTIFIER = "PUT_ONE_SERVICE_IDENTIFIER_HERE"
 
-def _looks_like_placeholder(value) -> bool:
-    if value is None:
-        return True
-    text = str(value).strip()
-    return text == "" or text.upper().startswith("YOUR_")
+headers = {"x-api-key": harness["api_key"]}
+params = {
+    "accountIdentifier": harness["account_id"],
+    "orgIdentifier": harness["org_id"],
+    "projectIdentifier": harness["project_id"],
+}
 
+url = f"{harness['base_url']}/ng/api/servicesV2/{SERVICE_IDENTIFIER}"
+resp = requests.get(url, headers=headers, params=params)
+resp.raise_for_status()
 
-def load_config(path: str = CONFIG_PATH) -> dict:
-    if not os.path.exists(path):
-        sys.exit(
-            f"Config file not found: {path}\n"
-            f"Create config.json in the same folder as this script "
-            f"(see config.json template) and fill in your real values."
-        )
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError as exc:
-            sys.exit(f"{path} is not valid JSON: {exc}")
+parsed = yaml.safe_load(resp.json()["data"]["service"]["yaml"])
+spec = parsed["service"]["serviceDefinition"]["spec"]
 
+print("=== Top-level keys in spec ===")
+print(list(spec.keys()))
 
-def require_harness(config: dict) -> dict:
-    harness = config.get("harness", {}) or {}
-    missing = [k for k in HARNESS_REQUIRED_FIELDS if _looks_like_placeholder(harness.get(k))]
-    if missing:
-        sys.exit(
-            f"config.json is missing or still has placeholder values for: {missing}\n"
-            f"Fill these in under the \"harness\" section before running this script."
-        )
-    return harness
+print("\n=== Raw 'artifacts' block ===")
+print(json.dumps(spec.get("artifacts", "NO ARTIFACTS KEY AT ALL"), indent=2))
 
-
-def require_gitlab(config: dict) -> dict:
-    gitlab = config.get("gitlab", {}) or {}
-    missing = [k for k in GITLAB_REQUIRED_FIELDS if _looks_like_placeholder(gitlab.get(k))]
-    if missing:
-        sys.exit(
-            f"config.json is missing or still has placeholder values for: {missing}\n"
-            f"Fill these in under the \"gitlab\" section before running this script."
-        )
-    return gitlab
+print("\n=== Raw 'manifests' block (for comparison) ===")
+print(json.dumps(spec.get("manifests", "NO MANIFESTS KEY"), indent=2))
