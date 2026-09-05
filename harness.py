@@ -6,6 +6,12 @@ This script only ever writes to the columns it owns (see OWNED_COLUMNS
 below) — anything Script 2 or Script 3 has already filled in for a given
 service is left exactly as-is on re-run.
 
+Schema note: branch values are tracked for reference only (Existing_Branch)
+— nothing gets pushed back to Harness for branch, so there's no "New_"
+branch column. ssc_appname/ssc_appversion each have TWO "New_" columns
+(suffixed 1 and 2) since Script 2 will populate them via two different
+matching methods, side by side, rather than picking one automatically.
+
 Credentials come from config.json in this same folder (see harness_config.py)
 — fill that in once and every script in this set reads from it.
 
@@ -60,17 +66,25 @@ RETRY_BACKOFF_SECONDS = 2
 # ===========================================================================
 # Shared column schema — every script in this 3-script set uses this exact
 # list and order. Keep it identical across all three files.
+#
+# Updated: New_Branch removed (branch values won't be pushed to Harness, so
+# there's no "new" value to track — Existing_Branch stays as a reference
+# only). New_ssc_appname/New_ssc_appversion split into two matching
+# methods' results (Method 1: repo-name matching; Method 2: DOCKER_IMAGE_NAME
+# search inside gitlab-ci.yml / ci-job-config.yml). Last Run Timestamp
+# removed.
 # ===========================================================================
 
 ALL_COLUMNS = [
     "Service Identifier", "Service Name", "Service Url",
     "Corresponding Gitlab component", "GitLab File Path",
-    "Existing_Branch", "New_Branch",
-    "Existing_ssc_appname", "New_ssc_appname",
-    "Existing_ssc_appversion", "New_ssc_appversion",
+    "Existing_Branch",
+    "Existing_ssc_appname", "Existing_ssc_appversion",
+    "New_ssc_appname1", "New_ssc_appversion1",
+    "New_ssc_appname2", "New_ssc_appversion2",
     "Artifact Path",
     "Approved for Update (Y/N)", "Variables Updated",
-    "Comments", "Last Run Timestamp",
+    "Comments",
 ]
 
 # Columns THIS script is allowed to write. Everything else on a row is
@@ -299,11 +313,6 @@ def set_script_comment(ws, row_idx: int, script_tag: str, text: str):
     cell.value = "\n".join(other_lines) if other_lines else None
 
 
-def set_timestamp(ws, row_idx: int):
-    col_idx = ALL_COLUMNS.index("Last Run Timestamp") + 1
-    ws.cell(row=row_idx, column=col_idx, value=datetime.now().isoformat(timespec="seconds"))
-
-
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -359,7 +368,6 @@ def main():
             set_owned_cell(ws, row_idx, "Service Name", svc_name)
             set_script_comment(ws, row_idx, "Script1", f"ERROR during extraction: {exc}")
 
-        set_timestamp(ws, row_idx)
         time.sleep(SLEEP_BETWEEN_SERVICES)
 
     wb.save(MASTER_EXCEL_FILE)
