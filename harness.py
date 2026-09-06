@@ -89,8 +89,8 @@ ALL_COLUMNS = [
     "Corresponding Gitlab component1", "GitLab File Path1",
     "Corresponding Gitlab component2", "GitLab File Path2",
     "New_ssc_appname1", "New_ssc_appname2", "Existing_ssc_appname", "Appname_final",
-    "New_ssc_appversion1", "New_ssc_appversion2", "Existing_ssc_appversion", "Appversion_final",
     "Artifact Path",
+    "New_ssc_appversion1", "New_ssc_appversion2", "Existing_ssc_appversion", "Appversion_final",
     "Approved for Update (Y/N)", "Variables Updated",
     "Comments", "Comments from Developer",
 ]
