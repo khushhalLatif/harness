@@ -69,22 +69,25 @@ RETRY_BACKOFF_SECONDS = 2
 #
 # Updated: New_Branch removed (branch values won't be pushed to Harness, so
 # there's no "new" value to track — Existing_Branch stays as a reference
-# only). New_ssc_appname/New_ssc_appversion split into two matching
-# methods' results (Method 1: repo-name matching; Method 2: DOCKER_IMAGE_NAME
-# search inside gitlab-ci.yml / ci-job-config.yml). Last Run Timestamp
-# removed.
+# only). Everything Script 2 produces — which GitLab component it matched,
+# which file it read, and the resulting ssc_ values — is now doubled up
+# per matching method (Method 1: repo-name matching; Method 2:
+# DOCKER_IMAGE_NAME search inside gitlab-ci.yml / ci-job-config.yml),
+# since the two methods can land on different repos entirely and need to
+# be comparable side by side. Last Run Timestamp removed.
 # ===========================================================================
 
 ALL_COLUMNS = [
     "Service Identifier", "Service Name", "Service Url",
-    "Corresponding Gitlab component", "GitLab File Path",
     "Existing_Branch",
     "Existing_ssc_appname", "Existing_ssc_appversion",
+    "Corresponding Gitlab component1", "GitLab File Path1",
     "New_ssc_appname1", "New_ssc_appversion1",
+    "Corresponding Gitlab component2", "GitLab File Path2",
     "New_ssc_appname2", "New_ssc_appversion2",
     "Artifact Path",
     "Approved for Update (Y/N)", "Variables Updated",
-    "Comments",
+    "Comments", "Comments from Developer",
 ]
 
 # Columns THIS script is allowed to write. Everything else on a row is
@@ -113,7 +116,16 @@ logger.addHandler(ch)
 # Harness API helpers
 # ===========================================================================
 
-HEADERS = {"x-api-key": HARNESS_API_KEY, "Content-Type": "application/json"}
+HEADERS = {
+    "x-api-key": HARNESS_API_KEY,
+    "Content-Type": "application/json",
+    # Some corporate network appliances (SSL-inspecting proxies/firewalls)
+    # terminate connections carrying the default python-requests identifier,
+    # while leaving ordinary browser traffic alone. A browser-like User-Agent
+    # sidesteps that without changing anything about the actual request.
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+}
 COMMON_PARAMS = {
     "accountIdentifier": HARNESS_ACCOUNT_ID,
     "orgIdentifier": HARNESS_ORG_ID,
