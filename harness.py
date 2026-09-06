@@ -373,7 +373,7 @@ def main():
             service_url = (
                 f"{HARNESS_UI_BASE}/ng/account/{HARNESS_ACCOUNT_ID}/module/cd"
                 f"/orgs/{HARNESS_ORG_ID}/projects/{HARNESS_PROJECT_ID}"
-                f"/services/{svc_id}/summary"
+                f"/services/{svc_id}"
             )
 
             set_owned_cell(ws, row_idx, "Service Name", svc_name)
