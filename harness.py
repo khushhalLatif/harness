@@ -48,13 +48,20 @@ HARNESS_ACCOUNT_ID = _harness["account_id"]
 HARNESS_ORG_ID = _harness["org_id"]
 HARNESS_PROJECT_ID = _harness["project_id"]
 
-# Best-effort Harness NG service URL. Verify against one real service URL
-# from your instance and adjust if it doesn't match — the exact routing
-# has changed between Harness versions before.
-HARNESS_APP_URL_TEMPLATE = (
-    "https://app.harness.io/ng/account/{account}/module/cd/orgs/{org}"
-    "/projects/{project}/services/{service}/summary"
-)
+# Harness's UI lives on the same host as the API you configured, just under
+# /ng instead of /gateway (e.g. API: https://harness.onefiserv.net/gateway,
+# UI: https://harness.onefiserv.net/ng/...). Deriving this from your actual
+# configured base_url — instead of a hardcoded "app.harness.io" — means the
+# generated links are correct regardless of which Harness host/cluster your
+# account is actually on.
+def build_harness_ui_base_url(api_base_url: str) -> str:
+    stripped = api_base_url.rstrip("/")
+    if stripped.endswith("/gateway"):
+        stripped = stripped[: -len("/gateway")]
+    return stripped
+
+
+HARNESS_UI_BASE = build_harness_ui_base_url(HARNESS_BASE_URL)
 
 MASTER_EXCEL_FILE = "harness_gitlab_master.xlsx"
 LOG_FILE = f"script1_harness_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -67,24 +74,22 @@ RETRY_BACKOFF_SECONDS = 2
 # Shared column schema — every script in this 3-script set uses this exact
 # list and order. Keep it identical across all three files.
 #
-# Updated: New_Branch removed (branch values won't be pushed to Harness, so
-# there's no "new" value to track — Existing_Branch stays as a reference
-# only). Everything Script 2 produces — which GitLab component it matched,
-# which file it read, and the resulting ssc_ values — is now doubled up
-# per matching method (Method 1: repo-name matching; Method 2:
-# DOCKER_IMAGE_NAME search inside gitlab-ci.yml / ci-job-config.yml),
-# since the two methods can land on different repos entirely and need to
-# be comparable side by side. Last Run Timestamp removed.
+# Updated: appname and appversion columns are now grouped together as
+# comparison blocks (New1, New2, Existing, then a Final column) instead of
+# being scattered near each matching method's own component/file columns
+# — the point is to make New1 vs New2 vs Existing directly comparable at a
+# glance. "_final" is filled in BY HAND (or by whichever process resolves
+# the comparison) and is the single value Script 3 actually pushes to
+# Harness — Script 1 and Script 2 never write to it.
 # ===========================================================================
 
 ALL_COLUMNS = [
     "Service Identifier", "Service Name", "Service Url",
     "Existing_Branch",
-    "Existing_ssc_appname", "Existing_ssc_appversion",
     "Corresponding Gitlab component1", "GitLab File Path1",
-    "New_ssc_appname1", "New_ssc_appversion1",
     "Corresponding Gitlab component2", "GitLab File Path2",
-    "New_ssc_appname2", "New_ssc_appversion2",
+    "New_ssc_appname1", "New_ssc_appname2", "Existing_ssc_appname", "Appname_final",
+    "New_ssc_appversion1", "New_ssc_appversion2", "Existing_ssc_appversion", "Appversion_final",
     "Artifact Path",
     "Approved for Update (Y/N)", "Variables Updated",
     "Comments", "Comments from Developer",
@@ -304,6 +309,18 @@ def set_owned_cell(ws, row_idx: int, column_name: str, value):
     ws.cell(row=row_idx, column=col_idx, value=value)
 
 
+def set_owned_link_cell(ws, row_idx: int, column_name: str, url: str):
+    """Like set_owned_cell, but also makes the cell an actual clickable
+    Excel hyperlink (not just text that looks like a URL)."""
+    if column_name not in OWNED_COLUMNS:
+        raise ValueError(f"Script 1 tried to write a column it doesn't own: {column_name}")
+    col_idx = ALL_COLUMNS.index(column_name) + 1
+    cell = ws.cell(row=row_idx, column=col_idx, value=url)
+    if url:
+        cell.hyperlink = url
+        cell.style = "Hyperlink"
+
+
 def set_script_comment(ws, row_idx: int, script_tag: str, text: str):
     """
     Replace any PREVIOUS comment(s) from this script (identified by
@@ -353,13 +370,14 @@ def main():
             variables = extract_variables(spec)
             branch = extract_first_branch(spec)
             artifact_path = extract_first_artifact_path(spec)
-            service_url = HARNESS_APP_URL_TEMPLATE.format(
-                account=HARNESS_ACCOUNT_ID, org=HARNESS_ORG_ID,
-                project=HARNESS_PROJECT_ID, service=svc_id,
+            service_url = (
+                f"{HARNESS_UI_BASE}/ng/account/{HARNESS_ACCOUNT_ID}/module/cd"
+                f"/orgs/{HARNESS_ORG_ID}/projects/{HARNESS_PROJECT_ID}"
+                f"/services/{svc_id}/summary"
             )
 
             set_owned_cell(ws, row_idx, "Service Name", svc_name)
-            set_owned_cell(ws, row_idx, "Service Url", service_url)
+            set_owned_link_cell(ws, row_idx, "Service Url", service_url)
             set_owned_cell(ws, row_idx, "Existing_Branch", branch)
             set_owned_cell(ws, row_idx, "Existing_ssc_appname", variables.get("ssc_appname", ""))
             set_owned_cell(ws, row_idx, "Existing_ssc_appversion", variables.get("ssc_appversion", ""))
