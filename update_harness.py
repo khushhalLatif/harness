@@ -4,21 +4,26 @@ SCRIPT 3 of 3 — pushes approved ssc_appname/ssc_appversion values to Harness.
 Reads harness_gitlab_master.xlsx. For every row:
 
   - If "Approved for Update (Y/N)" is exactly Y (case-insensitive) -> pushes
-    Appname_final and Appversion_final to that service's Advanced >
-    Variables on Harness (ssc_appname, ssc_appversion) — creating the
-    variable if it doesn't exist yet, updating it if it does.
-  - Anything else (N, blank, or anything other than Y) -> skipped entirely,
-    no Harness API call made for that row at all.
+    whichever of Appname_final / Appversion_final is actually filled in to
+    that service's Advanced > Variables on Harness (ssc_appname,
+    ssc_appversion) — creating the variable if it doesn't exist yet,
+    updating it if it does. A row with only one of the two filled in still
+    gets that one pushed; the other Harness variable is simply left alone.
+  - If NEITHER is filled in -> "no_data", not an error — there's just
+    nothing to push yet. No Harness API call is made for that row.
+  - Anything not approved (N, blank, or anything other than Y) -> skipped
+    entirely, no Harness API call made for that row at all.
 
-SAFETY — DRY_RUN defaults to True. Every approved row is fully evaluated
-and the exact change that WOULD be made is written to Comments, but no
-PUT is actually sent to Harness. Review a dry run first; only flip
-DRY_RUN to False once you're confident in the Approved/Final values.
+This script does NOT write anything to the Comments column, for any
+outcome (update, no_data, or error) — everything it does is still fully
+logged to the console and the .log file, just not into the spreadsheet.
+
+SAFETY — DRY_RUN defaults to True. Every approved row with data is fully
+evaluated and the exact change that WOULD be made is logged, but no PUT
+is actually sent to Harness. Review a dry run first; only flip DRY_RUN to
+False once you're confident in the Approved/Final values.
 
 This script never touches "Done by" — that's yours to fill in by hand.
-Its own result for each row is written into the (single) Comments column,
-using the same tagged-note pattern Script 1 and Script 2 already use, so
-nothing from either of those is overwritten.
 
 Run Script 1 and Script 2 first, fill in Approved for Update / Appname_final
 / Appversion_final by hand, THEN run this.
@@ -171,20 +176,6 @@ def get_cell(ws, row_idx: int, column_name: str):
     return ws.cell(row=row_idx, column=col_idx).value
 
 
-def set_script_comment(ws, row_idx: int, script_tag: str, text: str):
-    """Replaces this script's previous comment(s) on the row rather than
-    stacking new ones on top; Script 1/2's (and your own) notes are left
-    completely untouched."""
-    col_idx = ALL_COLUMNS.index("Comments") + 1
-    cell = ws.cell(row=row_idx, column=col_idx)
-    existing_lines = (cell.value or "").split("\n")
-    other_lines = [line for line in existing_lines if line and not line.startswith(f"[{script_tag} ")]
-    if text:
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        other_lines.append(f"[{script_tag} {stamp}] {text}")
-    cell.value = "\n".join(other_lines) if other_lines else None
-
-
 # ===========================================================================
 # Per-row processing
 # ===========================================================================
@@ -197,44 +188,43 @@ def process_row(ws, row_idx: int) -> str:
     approved = (approved_raw or "").strip().upper()
 
     if approved != "Y":
-        # No comment written for the common case (not approved yet) — keeps
-        # the Comments column from filling up with "skipped" on every row
-        # of a 330-row sheet where most rows simply aren't approved yet.
         return "skipped"
 
     if not svc_id:
-        set_script_comment(ws, row_idx, "Script3",
-                            "ERROR: Approved=Y but Service Identifier is blank")
+        logger.error("Approved=Y but Service Identifier is blank for '%s'", svc_name)
         return "error"
 
     appname_final = get_cell(ws, row_idx, "Appname_final")
     appversion_final = get_cell(ws, row_idx, "Appversion_final")
 
-    if not appname_final or not appversion_final:
-        set_script_comment(ws, row_idx, "Script3",
-                            "ERROR: Approved=Y but Appname_final/Appversion_final is blank "
-                            "— refusing to push an empty value")
-        return "error"
+    if not appname_final and not appversion_final:
+        # Nothing to push at all -- not a failure, just nothing decided yet.
+        return "no_data"
 
     try:
         yaml_dict = get_service_yaml(svc_id)
-        action_name, old_name = upsert_variable(yaml_dict, "ssc_appname", str(appname_final))
-        action_version, old_version = upsert_variable(yaml_dict, "ssc_appversion", str(appversion_final))
 
-        summary = (f"ssc_appname {old_name!r}->{appname_final!r} ({action_name}); "
-                   f"ssc_appversion {old_version!r}->{appversion_final!r} ({action_version})")
+        # Update whichever of the two is actually available -- a row with
+        # only one final value filled in still gets that one pushed, the
+        # other Harness variable is simply left as whatever it already is.
+        changes = []
+        if appname_final:
+            action, old = upsert_variable(yaml_dict, "ssc_appname", str(appname_final))
+            changes.append(f"ssc_appname {old!r}->{appname_final!r} ({action})")
+        if appversion_final:
+            action, old = upsert_variable(yaml_dict, "ssc_appversion", str(appversion_final))
+            changes.append(f"ssc_appversion {old!r}->{appversion_final!r} ({action})")
 
         if DRY_RUN:
-            set_script_comment(ws, row_idx, "Script3", f"DRY RUN — would update: {summary}")
+            logger.info("DRY RUN would update '%s': %s", svc_name, "; ".join(changes))
             return "dry_run"
 
         put_service_yaml(svc_id, yaml_dict)
-        set_script_comment(ws, row_idx, "Script3", f"Updated on Harness: {summary}")
+        logger.info("Updated '%s' on Harness: %s", svc_name, "; ".join(changes))
         return "updated"
 
     except Exception as exc:  # noqa: BLE001 — keep going across all rows
         logger.error("Failed on service '%s': %s", svc_name, exc)
-        set_script_comment(ws, row_idx, "Script3", f"ERROR: {exc}")
         return "error"
 
 
@@ -267,8 +257,7 @@ def main():
         try:
             result = process_row(ws, row_idx)
         except Exception as exc:  # noqa: BLE001
-            logger.error("Unhandled error on row %s: %s", row_idx, exc)
-            set_script_comment(ws, row_idx, "Script3", f"ERROR: {exc}")
+            logger.error("Unhandled error on row %s (%s): %s", row_idx, svc_name, exc)
             result = "error"
         counters[result] = counters.get(result, 0) + 1
 
