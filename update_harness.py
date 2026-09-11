@@ -54,7 +54,7 @@ HARNESS_PROJECT_ID = _harness["project_id"]
 MASTER_EXCEL_FILE = "harness_gitlab_master.xlsx"
 LOG_FILE = f"script3_harness_update_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-DRY_RUN = True  # False = actually push updates to Harness. Read the module docstring first.
+DRY_RUN = False  # pushing real updates directly to Harness — no dry run
 SLEEP_BETWEEN_ROWS = 0.3
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
@@ -252,7 +252,7 @@ def main():
 
     wb = load_workbook(MASTER_EXCEL_FILE)
     ws = wb.active
-    header = [c.value for c in ws[1]]
+    header = [c.value.strip() if isinstance(c.value, str) else c.value for c in ws[1]]
     if header != ALL_COLUMNS:
         sys.exit(
             f"{MASTER_EXCEL_FILE}'s header doesn't match the expected schema.\n"
